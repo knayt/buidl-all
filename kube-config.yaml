@@ -1,0 +1,2467 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stopphish-core
+  labels:
+    app: stopphish
+    package: core
+    service: ingress
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /static
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 8080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-common
+  labels:
+    app: stopphish
+    package: core
+data:
+  NAMESPACE: "stopphish"
+  LOGLEVEL: info
+  TRACING_ENABLED: "false"
+  TRANSPORTER: nats://nats:4222
+  TZ: UTC
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-db
+  labels:
+    app: stopphish
+  annotations:
+    policy.stopphish.io/preserve-keys: "data.DB_PASSWORD"
+data:
+  DB_HOST: "postgres"
+  DB_DATABASE: "stopphish"
+  DB_USERNAME: "stopphish"
+  DB_PASSWORD: "stopphish"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-redis
+  labels:
+    app: stopphish
+data:
+  MOL_CACHER__OPTIONS__REDIS__HOST: redis
+  QUEUE_DRIVER: redis://redis:6379
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-core
+  labels:
+    app: stopphish
+    package: core
+    service: api
+  annotations:
+    policy.stopphish.io/preserve-keys: "data.JWT_SECRET"
+data:
+  JWT_EXPIRES_H: "24"
+  JWT_SECRET: "stopphish"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app: stopphish
+    package: core
+    service: api
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: api
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: api
+    spec:
+      serviceAccountName: stopphish
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: "Always"
+      initContainers:
+        - name: change-ownership-container
+          image: busybox
+          command: ["/bin/sh", "-c", "mkdir -p /app/storage/temp && mkdir -p /app/storage/files && mkdir -p /app/storage/public && chown -R 1000:1000 /app/storage && ls -la /app/storage/"]
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          volumeMounts:
+            - mountPath: "/app/storage"
+              name: "stopphish-storage"
+      containers:
+        - name: api
+          image: get.stopphish.ru:5000/stopphish/stopphish-core
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+            - configMapRef:
+                name: stopphish-core
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - mountPath: "/app/storage/temp"
+              name: "stopphish-storage-temp"
+            - mountPath: "/app/storage/files"
+              name: "stopphish-storage-files"
+            - mountPath: "/app/storage/public"
+              name: "stopphish-storage-public"
+            - name: license
+              readOnly: true
+              mountPath: /license
+      volumes:
+        - name: stopphish-storage
+          hostPath:
+            path: "/srv/stopphish/storage/"
+        - name: stopphish-storage-temp
+          hostPath:
+            path: "/srv/stopphish/storage/temp"
+        - name: stopphish-storage-files
+          hostPath:
+            path: "/srv/stopphish/storage/files"
+        - name: stopphish-storage-public
+          hostPath:
+            path: "/srv/stopphish/storage/public"
+        - name: license
+          secret:
+            secretName: stopphish-license
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    app: stopphish
+    package: core
+    service: api
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: api
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    app: stopphish
+    package: core
+    service: frontend
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: frontend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: frontend
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: frontend
+          image: get.stopphish.ru:5000/stopphish/stopphish-admin-ui
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels:
+    app: stopphish
+    package: core
+    service: frontend
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: frontend
+  ports:
+    - port: 8080
+      targetPort: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  labels:
+    app: stopphish
+data:
+  nats.conf: |
+    max_payload: 8Mb
+    port: 4222
+    monitor_port: 8222
+    cluster {
+      name: "stopphish-microservices"
+      port: 6222
+      routes = []
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  labels:
+    app: stopphish
+    package: core
+    service: nats
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: nats
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: nats
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.8.4
+          command:
+            - "nats-server"
+            - "--config"
+            - "/etc/nats-config2/nats.conf"
+          ports:
+            - containerPort: 4222
+              name: nats
+            - containerPort: 6222
+              name: cluster
+            - containerPort: 8222
+              name: monitor
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/nats-config2
+      volumes:
+        - name: config-volume
+          configMap:
+            name: nats-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  labels:
+    app: stopphish
+    package: core
+    service: nats
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: nats
+  ports:
+    - port: 4222
+      name: nats
+      targetPort: 4222
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: stopphish
+    package: core
+    service: postgres
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: postgres
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:13.4
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: stopphish-db
+                  key: DB_DATABASE
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: stopphish-db
+                  key: DB_USERNAME
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: stopphish-db
+                  key: DB_PASSWORD
+          volumeMounts:
+            - mountPath: "/var/lib/postgresql/data"
+              name: "stopphish-pgdata"
+      volumes:
+        - hostPath:
+            path: "/srv/stopphish/postgres/"
+          name: stopphish-pgdata
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: stopphish
+    package: core
+    service: postgres
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: postgres
+  ports:
+    - port: 5432
+      name: postgres
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: stopphish-registry-pullsecret
+data:
+  .dockerconfigjson: >-
+    eyJhdXRocyI6eyJnZXQuc3RvcHBoaXNoLnJ1OjUwMDAiOnsidXNlcm5hbWUiOiJwdWJsaWMiLCJwYXNzd29yZCI6InB1YmxpYyIsImF1dGgiOiJjSFZpYkdsak9uQjFZbXhwWXc9PSJ9fX0=
+type: kubernetes.io/dockerconfigjson
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stopphish
+  labels:
+    app: stopphish
+    package: core
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    namespace: stopphish
+    name: stopphish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-admin-default
+subjects:
+  - kind: ServiceAccount
+    namespace: stopphish
+    name: stopphish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: stopphish
+    package: core
+    service: redis
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: redis
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:6.2.5-alpine
+          ports:
+            - containerPort: 6379
+              name: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: stopphish
+    package: core
+    service: redis
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: redis
+  ports:
+    - port: 6379
+      name: redis
+      targetPort: 6379
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stopphish-core
+  labels:
+    app: stopphish
+    package: core
+    service: ingress
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /static
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 8080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-common
+  labels:
+    app: stopphish
+    package: core
+data:
+  NAMESPACE: "stopphish"
+  LOGLEVEL: info
+  TRACING_ENABLED: "false"
+  TRANSPORTER: nats://nats:4222
+  TZ: UTC
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-db
+  labels:
+    app: stopphish
+  annotations:
+    policy.stopphish.io/preserve-keys: "data.DB_PASSWORD"
+data:
+  DB_HOST: "postgres"
+  DB_DATABASE: "stopphish"
+  DB_USERNAME: "stopphish"
+  DB_PASSWORD: "stopphish"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-redis
+  labels:
+    app: stopphish
+data:
+  MOL_CACHER__OPTIONS__REDIS__HOST: redis
+  QUEUE_DRIVER: redis://redis:6379
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-core
+  labels:
+    app: stopphish
+    package: core
+    service: api
+  annotations:
+    policy.stopphish.io/preserve-keys: "data.JWT_SECRET"
+data:
+  JWT_EXPIRES_H: "24"
+  JWT_SECRET: "stopphish"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app: stopphish
+    package: core
+    service: api
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: api
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: api
+    spec:
+      serviceAccountName: stopphish
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: "Always"
+      initContainers:
+        - name: change-ownership-container
+          image: busybox
+          command: ["/bin/chown", "-R", "1000:1000", "/app/storage/"]
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          volumeMounts:
+            - mountPath: "/app/storage"
+              name: "stopphish-storage"
+      containers:
+        - name: api
+          image: get.stopphish.ru:5000/stopphish/stopphish-core
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+            - configMapRef:
+                name: stopphish-core
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - mountPath: "/app/storage/temp"
+              name: "stopphish-storage-temp"
+            - mountPath: "/app/storage/files"
+              name: "stopphish-storage-files"
+            - mountPath: "/app/storage/public"
+              name: "stopphish-storage-public"
+            - name: license
+              readOnly: true
+              mountPath: /license
+      volumes:
+        - name: stopphish-storage
+          hostPath:
+            path: "/srv/stopphish/storage/"
+        - name: stopphish-storage-temp
+          hostPath:
+            path: "/srv/stopphish/storage/temp"
+        - name: stopphish-storage-files
+          hostPath:
+            path: "/srv/stopphish/storage/files"
+        - name: stopphish-storage-public
+          hostPath:
+            path: "/srv/stopphish/storage/public"
+        - name: license
+          secret:
+            secretName: stopphish-license
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    app: stopphish
+    package: core
+    service: api
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: api
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    app: stopphish
+    package: core
+    service: frontend
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: frontend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: frontend
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: frontend
+          image: get.stopphish.ru:5000/stopphish/stopphish-frontend
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels:
+    app: stopphish
+    package: core
+    service: frontend
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: frontend
+  ports:
+    - port: 8080
+      targetPort: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  labels:
+    app: stopphish
+data:
+  nats.conf: |
+    max_payload: 8Mb
+    port: 4222
+    monitor_port: 8222
+    cluster {
+      name: "stopphish-microservices"
+      port: 6222
+      routes = []
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  labels:
+    app: stopphish
+    package: core
+    service: nats
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: nats
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: nats
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.8.4
+          command:
+            - "nats-server"
+            - "--config"
+            - "/etc/nats-config2/nats.conf"
+          ports:
+            - containerPort: 4222
+              name: nats
+            - containerPort: 6222
+              name: cluster
+            - containerPort: 8222
+              name: monitor
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/nats-config2
+      volumes:
+        - name: config-volume
+          configMap:
+            name: nats-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  labels:
+    app: stopphish
+    package: core
+    service: nats
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: nats
+  ports:
+    - port: 4222
+      name: nats
+      targetPort: 4222
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: stopphish
+    package: core
+    service: postgres
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: postgres
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:13.4
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: stopphish-db
+                  key: DB_DATABASE
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: stopphish-db
+                  key: DB_USERNAME
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: stopphish-db
+                  key: DB_PASSWORD
+          volumeMounts:
+            - mountPath: "/var/lib/postgresql/data"
+              name: "stopphish-pgdata"
+      volumes:
+        - hostPath:
+            path: "/srv/stopphish/postgres/"
+          name: stopphish-pgdata
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: stopphish
+    package: core
+    service: postgres
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: postgres
+  ports:
+    - port: 5432
+      name: postgres
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: stopphish-registry-pullsecret
+data:
+  .dockerconfigjson: >-
+    eyJhdXRocyI6eyJnZXQuc3RvcHBoaXNoLnJ1OjUwMDAiOnsidXNlcm5hbWUiOiJwdWJsaWMiLCJwYXNzd29yZCI6InB1YmxpYyIsImF1dGgiOiJjSFZpYkdsak9uQjFZbXhwWXc9PSJ9fX0=
+type: kubernetes.io/dockerconfigjson
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stopphish
+  labels:
+    app: stopphish
+    package: core
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    namespace: stopphish
+    name: stopphish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-admin-default
+subjects:
+  - kind: ServiceAccount
+    namespace: stopphish
+    name: stopphish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: stopphish
+    package: core
+    service: redis
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: redis
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:6.2.5-alpine
+          ports:
+            - containerPort: 6379
+              name: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: stopphish
+    package: core
+    service: redis
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: redis
+  ports:
+    - port: 6379
+      name: redis
+      targetPort: 6379
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stopphish-core
+  labels:
+    app: stopphish
+    package: core
+    service: ingress
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /static
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 8080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-common
+  labels:
+    app: stopphish
+    package: core
+data:
+  NAMESPACE: "stopphish"
+  LOGLEVEL: info
+  TRACING_ENABLED: "false"
+  TRANSPORTER: nats://nats:4222
+  TZ: UTC
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-db
+  labels:
+    app: stopphish
+  annotations:
+    policy.stopphish.io/preserve-keys: "data.DB_PASSWORD"
+data:
+  DB_HOST: "postgres"
+  DB_DATABASE: "stopphish"
+  DB_USERNAME: "stopphish"
+  DB_PASSWORD: "stopphish"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-redis
+  labels:
+    app: stopphish
+data:
+  MOL_CACHER__OPTIONS__REDIS__HOST: redis
+  QUEUE_DRIVER: redis://redis:6379
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stopphish-core
+  labels:
+    app: stopphish
+    package: core
+    service: api
+  annotations:
+    policy.stopphish.io/preserve-keys: "data.JWT_SECRET"
+data:
+  JWT_EXPIRES_H: "24"
+  JWT_SECRET: "stopphish"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app: stopphish
+    package: core
+    service: api
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: api
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: api
+    spec:
+      serviceAccountName: stopphish
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: "Always"
+      initContainers:
+        - name: change-ownership-container
+          image: busybox
+          command: ["/bin/chown", "-R", "1000:1000", "/app/storage/"]
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          volumeMounts:
+            - mountPath: "/app/storage"
+              name: "stopphish-storage"
+      containers:
+        - name: api
+          image: get.stopphish.ru:5000/stopphish/stopphish-core
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+            - configMapRef:
+                name: stopphish-core
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - mountPath: "/app/storage/files"
+              name: "stopphish-storage-files"
+            - mountPath: "/app/storage/public"
+              name: "stopphish-storage-public"
+            - name: license
+              readOnly: true
+              mountPath: /license
+      volumes:
+        - name: stopphish-storage
+          hostPath:
+            path: "/srv/stopphish/storage/"
+        - name: stopphish-storage-files
+          hostPath:
+            path: "/srv/stopphish/storage/files"
+        - name: stopphish-storage-public
+          hostPath:
+            path: "/srv/stopphish/storage/public"
+        - name: license
+          secret:
+            secretName: stopphish-license
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    app: stopphish
+    package: core
+    service: api
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: api
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    app: stopphish
+    package: core
+    service: frontend
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: frontend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: frontend
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: frontend
+          image: get.stopphish.ru:5000/stopphish/stopphish-frontend
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels:
+    app: stopphish
+    package: core
+    service: frontend
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: frontend
+  ports:
+    - port: 8080
+      targetPort: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  labels:
+    app: stopphish
+data:
+  nats.conf: |
+    max_payload: 8Mb
+    port: 4222
+    monitor_port: 8222
+    cluster {
+      name: "stopphish-microservices"
+      port: 6222
+      routes = []
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  labels:
+    app: stopphish
+    package: core
+    service: nats
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: nats
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: nats
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.8.4
+          command:
+            - "nats-server"
+            - "--config"
+            - "/etc/nats-config2/nats.conf"
+          ports:
+            - containerPort: 4222
+              name: nats
+            - containerPort: 6222
+              name: cluster
+            - containerPort: 8222
+              name: monitor
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/nats-config2
+      volumes:
+        - name: config-volume
+          configMap:
+            name: nats-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  labels:
+    app: stopphish
+    package: core
+    service: nats
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: nats
+  ports:
+    - port: 4222
+      name: nats
+      targetPort: 4222
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: stopphish
+    package: core
+    service: postgres
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: postgres
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:13.4
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: stopphish-db
+                  key: DB_DATABASE
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: stopphish-db
+                  key: DB_USERNAME
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: stopphish-db
+                  key: DB_PASSWORD
+          volumeMounts:
+            - mountPath: "/var/lib/postgresql/data"
+              name: "stopphish-pgdata"
+      volumes:
+        - hostPath:
+            path: "/srv/stopphish/postgres/"
+          name: stopphish-pgdata
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: stopphish
+    package: core
+    service: postgres
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: postgres
+  ports:
+    - port: 5432
+      name: postgres
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: stopphish-registry-pullsecret
+data:
+  .dockerconfigjson: >-
+    eyJhdXRocyI6eyJnZXQuc3RvcHBoaXNoLnJ1OjUwMDAiOnsidXNlcm5hbWUiOiJwdWJsaWMiLCJwYXNzd29yZCI6InB1YmxpYyIsImF1dGgiOiJjSFZpYkdsak9uQjFZbXhwWXc9PSJ9fX0=
+type: kubernetes.io/dockerconfigjson
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stopphish
+  labels:
+    app: stopphish
+    package: core
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    namespace: stopphish
+    name: stopphish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-admin-default
+subjects:
+  - kind: ServiceAccount
+    namespace: stopphish
+    name: stopphish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: stopphish
+    package: core
+    service: redis
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: core
+      service: redis
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: core
+        service: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:6.2.5-alpine
+          ports:
+            - containerPort: 6379
+              name: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: stopphish
+    package: core
+    service: redis
+spec:
+  selector:
+    app: stopphish
+    package: core
+    service: redis
+  ports:
+    - port: 6379
+      name: redis
+      targetPort: 6379
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stopphish-hosting-api
+  labels:
+    app: stopphish
+    package: hosting
+    service: api-ingress
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api/hosting
+            pathType: Prefix
+            backend:
+              service:
+                name: api-hosting
+                port:
+                  number: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stopphish-hosting
+  labels:
+    app: stopphish
+    package: hosting
+    service: hosting-ingress
+spec:
+  rules:
+    - host: domain.stopphish.k8s
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-hosting
+                port:
+                  number: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-hosting
+  labels:
+    app: stopphish
+    package: hosting
+    service: hosting
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: hosting
+      service: hosting
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: hosting
+        service: hosting
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: change-ownership-container
+          image: busybox
+          command: ["/bin/chown", "-R", "1000:1000", "/app/storage/websites"]
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          volumeMounts:
+            - mountPath: "/app/storage/websites"
+              name: "stopphish-storage-websites"
+      containers:
+        - name: hosting
+          image: get.stopphish.ru:5000/stopphish/stopphish-hosting
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - mountPath: "/app/storage/websites"
+              name: "stopphish-storage-websites"
+            - mountPath: "/app/storage/temp"
+              name: "stopphish-storage-temp"
+      volumes:
+        - name: stopphish-storage-websites
+          hostPath:
+            path: "/srv/stopphish/storage/websites"
+        - name: stopphish-storage-temp
+          hostPath:
+            path: "/srv/stopphish/storage/temp"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-hosting
+  labels:
+    app: stopphish
+    package: hosting
+    service: hosting
+spec:
+  selector:
+    app: stopphish
+    package: hosting
+    service: hosting
+  ports:
+    - port: 3000
+      targetPort: 3000
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stopphish-hosting-api
+  labels:
+    app: stopphish
+    package: hosting
+    service: api-ingress
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api/hosting
+            pathType: Prefix
+            backend:
+              service:
+                name: api-hosting
+                port:
+                  number: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stopphish-hosting
+  labels:
+    app: stopphish
+    package: hosting
+    service: hosting-ingress
+spec:
+  rules:
+    - host: domain.stopphish.k8s
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-hosting
+                port:
+                  number: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-hosting
+  labels:
+    app: stopphish
+    package: hosting
+    service: hosting
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: hosting
+      service: hosting
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: hosting
+        service: hosting
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: change-ownership-container
+          image: busybox
+          command: ["/bin/chown", "-R", "1000:1000", "/app/storage/websites"]
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          volumeMounts:
+            - mountPath: "/app/storage/websites"
+              name: "stopphish-storage-websites"
+      containers:
+        - name: hosting
+          image: get.stopphish.ru:5000/stopphish/stopphish-hosting
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - mountPath: "/app/storage/websites"
+              name: "stopphish-storage-websites"
+      volumes:
+        - name: stopphish-storage-websites
+          hostPath:
+            path: "/srv/stopphish/storage/websites"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-hosting
+  labels:
+    app: stopphish
+    package: hosting
+    service: hosting
+spec:
+  selector:
+    app: stopphish
+    package: hosting
+    service: hosting
+  ports:
+    - port: 3000
+      targetPort: 3000
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-website-scraper
+  labels:
+    app: stopphish
+    package: website-scraper
+    service: website-scraper
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: website-scraper
+      service: website-scraper
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: website-scraper
+        service: website-scraper
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: website-scraper
+          image: get.stopphish.ru:5000/stopphish/stopphish-website-scraper
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+          volumeMounts:
+            - mountPath: "/app/storage/websites"
+              name: "stopphish-storage-websites"
+      volumes:
+        - name: stopphish-storage-websites
+          hostPath:
+            path: "/srv/stopphish/storage/websites"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-mailer
+  labels:
+    app: stopphish
+    package: mailer
+    service: mailer
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: mailer
+      service: mailer
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: mailer
+        service: mailer
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: api
+          image: get.stopphish.ru:5000/stopphish/stopphish-mailer
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+          volumeMounts:
+            - mountPath: "/app/storage/temp"
+              name: "stopphish-storage-temp"
+      volumes:
+        - name: stopphish-storage-temp
+          hostPath:
+            path: "/srv/stopphish/storage/temp""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-mailer
+  labels:
+    app: stopphish
+    package: mailer
+    service: mailer
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: mailer
+      service: mailer
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: mailer
+        service: mailer
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: api
+          image: get.stopphish.ru:5000/stopphish/stopphish-mailer
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-campaigns
+  labels:
+    app: stopphish
+    package: campaigns
+    service: campaigns
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: campaigns
+      service: campaigns
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: campaigns
+        service: campaigns
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: api
+          image: get.stopphish.ru:5000/stopphish/stopphish-campaigns
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-campaigns
+  labels:
+    app: stopphish
+    package: campaigns
+    service: campaigns
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: campaigns
+      service: campaigns
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: campaigns
+        service: campaigns
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: api
+          image: get.stopphish.ru:5000/stopphish/stopphish-campaigns
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-campaigns
+  labels:
+    app: stopphish
+    package: campaigns
+    service: campaigns
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: campaigns
+      service: campaigns
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: campaigns
+        service: campaigns
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: api
+          image: get.stopphish.ru:5000/stopphish/stopphish-campaigns
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stopphish-mailserver
+  labels:
+    app: stopphish
+    package: mailserver
+    service: mailserver
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /postfixadmin
+            pathType: Prefix
+            backend:
+              service:
+                name: mailserver
+                port:
+                  number: 80
+          - path: /roundcubemail
+            pathType: Prefix
+            backend:
+              service:
+                name: mailserver
+                port:
+                  number: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailserver
+  labels:
+    app: stopphish
+    package: mailserver
+    service: mailserver
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: mailserver
+      service: mailserver
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: mailserver
+        service: mailserver
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: mailserver
+          image: get.stopphish.ru:5000/stopphish/stopphish-mailserver
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+          env:
+            - name: DOMAIN_NAME
+              value: stopphish.test
+            - name: ADMIN_USERNAME
+              value: stopphish
+            - name: ADMIN_PASSWD
+              value: stopphish
+            - name: USERS
+              value: "default:st0pph1sh"
+          ports:
+            - name: http
+              containerPort: 80
+            - name: smtp
+              containerPort: 25
+              hostPort: 25
+            - name: pop3
+              containerPort: 110
+              hostPort: 110
+            - name: imap
+              containerPort: 143
+              hostPort: 143
+            - name: smtps
+              containerPort: 465
+              hostPort: 465
+            - name: imaps
+              containerPort: 993
+              hostPort: 993
+            - name: pop3s
+              containerPort: 995
+              hostPort: 995
+          volumeMounts:
+            - mountPath: "/var/vmail"
+              name: "stopphish-mailserver-vmail"
+            - mountPath: "/var/lib/mysql"
+              name: "stopphish-mailserver-mysql"
+      volumes:
+        - name: stopphish-mailserver-vmail
+          hostPath:
+            path: "/srv/stopphish/mailserver/vmail"
+        - name: stopphish-mailserver-mysql
+          hostPath:
+            path: "/srv/stopphish/mailserver/mysql"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailserver
+  labels:
+    app: stopphish
+    package: mailserver
+    service: mailserver
+spec:
+  selector:
+    app: stopphish
+    package: mailserver
+    service: mailserver
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: smtp
+      port: 25
+      targetPort: 25
+    - name: pop3
+      port: 110
+      targetPort: 110
+    - name: imap
+      port: 143
+      targetPort: 143
+    - name: smtps
+      port: 465
+      targetPort: 465
+    - name: imaps
+      port: 993
+      targetPort: 993
+    - name: pop3s
+      port: 995
+      targetPort: 995
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-lms
+  labels:
+    app: stopphish
+    package: lms
+    service: lms
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: lms
+      service: lms
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: lms
+        service: lms
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: change-ownership-container
+          image: busybox
+          command: ["/bin/chown", "-R", "1000:1000", "/app/storage/lms"]
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          volumeMounts:
+            - mountPath: "/app/storage/lms"
+              name: "stopphish-storage-lms"
+      containers:
+        - name: lms
+          image: get.stopphish.ru:5000/stopphish/stopphish-lms-api
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - mountPath: "/app/storage/lms"
+              name: "stopphish-storage-lms"
+            - mountPath: "/app/storage/temp"
+              name: "stopphish-storage-temp"
+      volumes:
+        - name: stopphish-storage-lms
+          hostPath:
+            path: "/srv/stopphish/storage/lms"
+        - name: stopphish-storage-temp
+          hostPath:
+            path: "/srv/stopphish/storage/temp"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-lms
+  labels:
+    app: stopphish
+    package: lms
+    service: lms
+spec:
+  selector:
+    app: stopphish
+    package: lms
+    service: lms
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lms-frontend
+  labels:
+    app: stopphish
+    package: lms
+    service: lms-frontend
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: lms
+      service: lms-frontend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: lms
+        service: lms-frontend
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: lms-frontend
+          image: get.stopphish.ru:5000/stopphish/stopphish-lms-frontend
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lms-frontend
+  labels:
+    app: stopphish
+    package: lms
+    service: lms-frontend
+spec:
+  selector:
+    app: stopphish
+    package: lms
+    service: lms-frontend
+  ports:
+    - port: 8080
+      targetPort: 80
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-lms
+  labels:
+    app: stopphish
+    package: lms
+    service: lms
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: lms
+      service: lms
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: lms
+        service: lms
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: change-ownership-container
+          image: busybox
+          command: ["/bin/chown", "-R", "1000:1000", "/app/storage/lms"]
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          volumeMounts:
+            - mountPath: "/app/storage/lms"
+              name: "stopphish-storage-lms"
+      containers:
+        - name: lms
+          image: get.stopphish.ru:5000/stopphish/stopphish-lms
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - mountPath: "/app/storage/lms"
+              name: "stopphish-storage-lms"
+            - mountPath: "/app/storage/temp"
+              name: "stopphish-storage-temp"
+      volumes:
+        - name: stopphish-storage-lms
+          hostPath:
+            path: "/srv/stopphish/storage/lms"
+        - name: stopphish-storage-temp
+          hostPath:
+            path: "/srv/stopphish/storage/temp"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-lms
+  labels:
+    app: stopphish
+    package: lms
+    service: lms
+spec:
+  selector:
+    app: stopphish
+    package: lms
+    service: lms
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lms-frontend
+  labels:
+    app: stopphish
+    package: lms
+    service: lms-frontend
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: lms
+      service: lms-frontend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: lms
+        service: lms-frontend
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: lms-frontend
+          image: get.stopphish.ru:5000/stopphish/stopphish-lms-frontend
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lms-frontend
+  labels:
+    app: stopphish
+    package: lms
+    service: lms-frontend
+spec:
+  selector:
+    app: stopphish
+    package: lms
+    service: lms-frontend
+  ports:
+    - port: 8080
+      targetPort: 80
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-lms
+  labels:
+    app: stopphish
+    package: lms
+    service: lms
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: lms
+      service: lms
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: lms
+        service: lms
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: change-ownership-container
+          image: busybox
+          command: ["/bin/chown", "-R", "1000:1000", "/app/storage/lms"]
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          volumeMounts:
+            - mountPath: "/app/storage/lms"
+              name: "stopphish-storage-lms"
+      containers:
+        - name: lms
+          image: get.stopphish.ru:5000/stopphish/stopphish-lms
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - mountPath: "/app/storage/lms"
+              name: "stopphish-storage-lms"
+      volumes:
+        - name: stopphish-storage-lms
+          hostPath:
+            path: "/srv/stopphish/storage/lms"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-lms
+  labels:
+    app: stopphish
+    package: lms
+    service: lms
+spec:
+  selector:
+    app: stopphish
+    package: lms
+    service: lms
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lms-frontend
+  labels:
+    app: stopphish
+    package: lms
+    service: lms-frontend
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: lms
+      service: lms-frontend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: lms
+        service: lms-frontend
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: lms-frontend
+          image: get.stopphish.ru:5000/stopphish/stopphish-lms-frontend
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lms-frontend
+  labels:
+    app: stopphish
+    package: lms
+    service: lms-frontend
+spec:
+  selector:
+    app: stopphish
+    package: lms
+    service: lms-frontend
+  ports:
+    - port: 8080
+      targetPort: 80
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-ldap
+  labels:
+    app: stopphish
+    package: ldap
+    service: ldap
+spec:
+  selector:
+    matchLabels:
+      app: stopphish
+      package: ldap
+      service: ldap
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: stopphish
+        package: ldap
+        service: ldap
+    spec:
+      imagePullSecrets:
+        - name: stopphish-registry-pullsecret
+      containers:
+        - name: api
+          image: get.stopphish.ru:5000/stopphish/stopphish-ldap
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: stopphish-common
+            - configMapRef:
+                name: stopphish-db
+            - configMapRef:
+                name: stopphish-redis
